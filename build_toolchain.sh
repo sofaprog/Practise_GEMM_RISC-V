@@ -11,7 +11,7 @@ fi
 git submodule update --init riscv-gnu-toolchain
 mkdir -p toolchain
 cd riscv-gnu-toolchain
-git submodule update --init --recursive binutils gcc gdb
+git submodule update --init --recursive binutils gcc gdb newlib
 cd binutils
 git apply ../binutils.patch
 cd ../gcc
