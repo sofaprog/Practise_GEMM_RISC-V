@@ -8,7 +8,6 @@
 #include <vector>
 #include <algorithm>
 
-// GENERATED MATRICES
 #include "../../generated/nasa2910.h"
 #include "../../generated/bcsstk13.h"
 #include "../../generated/ex5.h"
@@ -20,9 +19,6 @@
 #include "../../generated/crystm03.h"
 #include "../../generated/bcsstk18.h"
 
-// ============================================================================
-// STRUCTURES
-// ============================================================================
 
 struct CSRf32 {
     uint32_t n{};
@@ -35,23 +31,20 @@ struct CSRf32 {
 };
 
 struct SELLCSigma {
-    uint32_t n;           // кол-во строк
-    uint32_t m;           // кол-во столбцов
-    uint32_t C;           // размер слайса
+    uint32_t n;        
+    uint32_t m;         
+    uint32_t C;          
     uint32_t num_slices;
     uint32_t nnz_padded;
     
-    std::vector<uint32_t> slice_ptr;     // границы слайсов
-    std::vector<uint32_t> slice_lengths; // макс nnz в каждом слайсе
-    std::vector<uint32_t> slice_col_idx; // индексы
-    std::vector<float> slice_vals;       // значения
+    std::vector<uint32_t> slice_ptr;  
+    std::vector<uint32_t> slice_lengths; 
+    std::vector<uint32_t> slice_col_idx; 
+    std::vector<float> slice_vals;      
 };
 
 static volatile float sink[1];
 
-// ============================================================================
-// MATRIX CREATION
-// ============================================================================
 
 CSRf32 make_matrix(
     uint32_t n,
@@ -73,10 +66,6 @@ CSRf32 make_matrix(
     return A;
 }
 
-// ============================================================================
-// CSR TO SELL-C-SIGMA CONVERSION
-// ============================================================================
-
 SELLCSigma csr_to_sellc_sigma(const CSRf32& A_csr, uint32_t C = 8) {
     SELLCSigma A;
     A.n = A_csr.n;
@@ -89,12 +78,11 @@ SELLCSigma csr_to_sellc_sigma(const CSRf32& A_csr, uint32_t C = 8) {
     
     A.slice_ptr[0] = 0;
     
-    // Для каждого слайса
+
     for (uint32_t sid = 0; sid < A.num_slices; ++sid) {
         uint32_t row_start = sid * C;
         uint32_t row_end = std::min((sid + 1) * C, A_csr.n);
         
-        // Найди максимальное кол-во ненулевых элементов в этом слайсе
         uint32_t max_nnz = 0;
         for (uint32_t row = row_start; row < row_end; ++row) {
             uint32_t nnz_in_row = A_csr.row_ptr[row + 1] - A_csr.row_ptr[row];
@@ -103,19 +91,16 @@ SELLCSigma csr_to_sellc_sigma(const CSRf32& A_csr, uint32_t C = 8) {
         
         A.slice_lengths[sid] = max_nnz;
         
-        // Сохрани элементы слайса
         for (uint32_t row = row_start; row < row_end; ++row) {
             uint32_t row_nnz_start = A_csr.row_ptr[row];
             uint32_t row_nnz_end = A_csr.row_ptr[row + 1];
             uint32_t nnz_in_row = row_nnz_end - row_nnz_start;
             
-            // Скопируй реальные элементы
             for (uint32_t idx = row_nnz_start; idx < row_nnz_end; ++idx) {
                 A.slice_col_idx.push_back(A_csr.col_idx[idx]);
                 A.slice_vals.push_back(A_csr.vals[idx]);
             }
             
-            // Добавь padding (нули)
             for (uint32_t p = 0; p < max_nnz - nnz_in_row; ++p) {
                 A.slice_col_idx.push_back(0);
                 A.slice_vals.push_back(0.0f);
@@ -129,9 +114,6 @@ SELLCSigma csr_to_sellc_sigma(const CSRf32& A_csr, uint32_t C = 8) {
     return A;
 }
 
-// ============================================================================
-// CSR SPMV IMPLEMENTATIONS
-// ============================================================================
 
 void spmv_csr_scalar(const CSRf32& A, const float* x, float* y) {
     for (uint32_t r = 0; r < A.n; ++r) {
@@ -169,9 +151,6 @@ void spmv_csr_rvv(const CSRf32& A, const float* x, float* y) {
     }
 }
 
-// ============================================================================
-// SELL-C-SIGMA SPMV IMPLEMENTATIONS
-// ============================================================================
 
 void spmv_sellc_sigma_scalar(const SELLCSigma& A, const float* x, float* y) {
     for (uint32_t sid = 0; sid < A.num_slices; ++sid) {
@@ -235,9 +214,6 @@ void spmv_sellc_sigma_rvv(const SELLCSigma& A, const float* x, float* y) {
     }
 }
 
-// ============================================================================
-// VERIFICATION
-// ============================================================================
 
 bool verify_results(
     const std::vector<float>& ref,
@@ -261,9 +237,6 @@ bool verify_results(
     return true;
 }
 
-// ============================================================================
-// MAIN
-// ============================================================================
 
 int main() {
     std::vector<CSRf32> matrices;
@@ -316,50 +289,33 @@ int main() {
             x[i] = static_cast<float>(i) * 0.001f;
         }
 
-        // =====================================================================
-        // CSR SCALAR
-        // =====================================================================
         auto t1 = std::chrono::high_resolution_clock::now();
         spmv_csr_scalar(A_csr, x.data(), y_csr_scalar.data());
         auto t2 = std::chrono::high_resolution_clock::now();
         auto csr_scalar_us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
 
-        // =====================================================================
-        // CSR RVV
-        // =====================================================================
         auto t3 = std::chrono::high_resolution_clock::now();
         spmv_csr_rvv(A_csr, x.data(), y_csr_rvv.data());
         auto t4 = std::chrono::high_resolution_clock::now();
         auto csr_rvv_us = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
 
-        // Проверка CSR RVV
         if (!verify_results(y_csr_scalar, y_csr_rvv)) {
             std::cerr << "CSR RVV verification failed!\n";
             return 1;
         }
 
-        // =====================================================================
-        // CONVERT TO SELL-C-SIGMA
-        // =====================================================================
         SELLCSigma A_sellc = csr_to_sellc_sigma(A_csr, 8);
 
-        // =====================================================================
-        // SELL-C-SIGMA RVV
-        // =====================================================================
         auto t5 = std::chrono::high_resolution_clock::now();
         spmv_sellc_sigma_rvv(A_sellc, x.data(), y_sellc_rvv.data());
         auto t6 = std::chrono::high_resolution_clock::now();
         auto sellc_rvv_us = std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
 
-        // Проверка SELL-C-SIGMA RVV
         if (!verify_results(y_csr_scalar, y_sellc_rvv)) {
             std::cerr << "SELL-C-Sigma RVV verification failed!\n";
             return 1;
         }
 
-        // =====================================================================
-        // МЕТРИКИ
-        // =====================================================================
         double csr_scalar_gflops = (2.0 * A_csr.nnz) / (csr_scalar_us * 1e-6) / 1e9;
         double csr_rvv_gflops = (2.0 * A_csr.nnz) / (csr_rvv_us * 1e-6) / 1e9;
         double sellc_rvv_gflops = (2.0 * A_csr.nnz) / (sellc_rvv_us * 1e-6) / 1e9;
@@ -386,9 +342,6 @@ int main() {
         sink[0] = y_csr_rvv[0];
     }
 
-    // =========================================================================
-    // ИТОГОВАЯ СТАТИСТИКА
-    // =========================================================================
     std::cout << std::string(90, '=') << "\n"
               << "TOTAL STATISTICS\n"
               << std::string(90, '=') << "\n";
