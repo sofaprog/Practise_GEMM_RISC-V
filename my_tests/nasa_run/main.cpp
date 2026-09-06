@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <numeric>
 
 #include "../../generated/nasa2910.h"
 #include "../../generated/bcsstk13.h"
@@ -34,13 +35,15 @@ struct SELLCSigma {
     uint32_t n;        
     uint32_t m;         
     uint32_t C;          
+    uint32_t sigma;
     uint32_t num_slices;
     uint32_t nnz_padded;
     
-    std::vector<uint32_t> slice_ptr;  
-    std::vector<uint32_t> slice_lengths; 
-    std::vector<uint32_t> slice_col_idx; 
-    std::vector<float> slice_vals;      
+    std::vector<uint32_t> slice_ptr;
+    std::vector<uint32_t> slice_lengths;
+    std::vector<uint32_t> slice_col_idx;
+    std::vector<float> slice_vals;
+    std::vector<uint32_t> row_perm;
 };
 
 static volatile float sink[1];
@@ -66,44 +69,80 @@ CSRf32 make_matrix(
     return A;
 }
 
-SELLCSigma csr_to_sellc_sigma(const CSRf32& A_csr, uint32_t C = 8) {
+SELLCSigma csr_to_sellc_sigma(const CSRf32& A_csr, uint32_t C = 8, uint32_t sigma = 0) {
     SELLCSigma A;
     A.n = A_csr.n;
     A.m = A_csr.m;
     A.C = C;
+    //sort
+    if (sigma == 0) {
+        sigma = std::min((uint32_t)(C * 8), A_csr.n);
+    }
+    A.sigma = sigma;
+    
     A.num_slices = (A_csr.n + C - 1) / C;
     
     A.slice_ptr.resize(A.num_slices + 1);
     A.slice_lengths.resize(A.num_slices);
+    A.row_perm.resize(A.n);
     
+    std::vector<uint32_t> row_nnz(A.n);
+    for (uint32_t i = 0; i < A.n; ++i) {
+        row_nnz[i] = A_csr.row_ptr[i + 1] - A_csr.row_ptr[i];
+    }
+    
+    std::iota(A.row_perm.begin(), A.row_perm.end(), 0);
+    
+    for (uint32_t window_start = 0; window_start < A.n; window_start += sigma) {
+        uint32_t window_end = std::min(window_start + sigma, A_csr.n);
+        
+        std::vector<uint32_t> window_indices;
+        for (uint32_t i = window_start; i < window_end; ++i) {
+            window_indices.push_back(i);
+        }
+        
+        std::sort(window_indices.begin(), window_indices.end(),
+                  [&](uint32_t a, uint32_t b) {
+                      return row_nnz[a] > row_nnz[b];
+                  });
+        
+        for (size_t i = 0; i < window_indices.size(); ++i) {
+            A.row_perm[window_start + i] = window_indices[i];
+        }
+    }
+    //slices
     A.slice_ptr[0] = 0;
     
-
     for (uint32_t sid = 0; sid < A.num_slices; ++sid) {
         uint32_t row_start = sid * C;
         uint32_t row_end = std::min((sid + 1) * C, A_csr.n);
+        uint32_t num_rows_in_slice = row_end - row_start;
         
         uint32_t max_nnz = 0;
-        for (uint32_t row = row_start; row < row_end; ++row) {
-            uint32_t nnz_in_row = A_csr.row_ptr[row + 1] - A_csr.row_ptr[row];
+        for (uint32_t local_row = 0; local_row < num_rows_in_slice; ++local_row) {
+            uint32_t global_row = A.row_perm[row_start + local_row];
+            uint32_t nnz_in_row = A_csr.row_ptr[global_row + 1] - A_csr.row_ptr[global_row];
             max_nnz = std::max(max_nnz, nnz_in_row);
         }
         
         A.slice_lengths[sid] = max_nnz;
         
-        for (uint32_t row = row_start; row < row_end; ++row) {
-            uint32_t row_nnz_start = A_csr.row_ptr[row];
-            uint32_t row_nnz_end = A_csr.row_ptr[row + 1];
-            uint32_t nnz_in_row = row_nnz_end - row_nnz_start;
-            
-            for (uint32_t idx = row_nnz_start; idx < row_nnz_end; ++idx) {
-                A.slice_col_idx.push_back(A_csr.col_idx[idx]);
-                A.slice_vals.push_back(A_csr.vals[idx]);
-            }
-            
-            for (uint32_t p = 0; p < max_nnz - nnz_in_row; ++p) {
-                A.slice_col_idx.push_back(0);
-                A.slice_vals.push_back(0.0f);
+        // column major
+        for (uint32_t j = 0; j < max_nnz; ++j) {
+            for (uint32_t local_row = 0; local_row < num_rows_in_slice; ++local_row) {
+                uint32_t global_row = A.row_perm[row_start + local_row];
+                uint32_t row_nnz_start = A_csr.row_ptr[global_row];
+                uint32_t row_nnz_end = A_csr.row_ptr[global_row + 1];
+                uint32_t nnz_in_row = row_nnz_end - row_nnz_start;
+                
+                if (j < nnz_in_row) {
+                    uint32_t elem_idx = row_nnz_start + j;
+                    A.slice_col_idx.push_back(A_csr.col_idx[elem_idx]);
+                    A.slice_vals.push_back(A_csr.vals[elem_idx]);
+                } else {
+                    A.slice_col_idx.push_back(0);
+                    A.slice_vals.push_back(0.0f);
+                }
             }
         }
         
@@ -137,14 +176,18 @@ void spmv_csr_rvv(const CSRf32& A, const float* x, float* y) {
 
             vfloat32m1_t vvals = __riscv_vle32_v_f32m1(&A.vals[k], vl);
             vuint32m1_t vcols = __riscv_vle32_v_u32m1(&A.col_idx[k], vl);
+            
+            // Умножаем (RVV)
             vuint32m1_t voff = __riscv_vsll_vx_u32m1(vcols, 2, vl);
             vfloat32m1_t vx = __riscv_vluxei32_v_f32m1(x, voff, vl);
             vfloat32m1_t vprod = __riscv_vfmul_vv_f32m1(vvals, vx, vl);
 
-            vfloat32m1_t vzero = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-            vfloat32m1_t vred = __riscv_vfredosum_vs_f32m1_f32m1(vprod, vzero, vl);
+            for (size_t i = 0; i < vl; ++i) {
+                vfloat32m1_t shifted = __riscv_vslidedown_vx_f32m1(vprod, (uint32_t)i, vl);
+                float prod = __riscv_vfmv_f_s_f32m1_f32(shifted);
+                sum += prod;
+            }
 
-            sum += __riscv_vfmv_f_s_f32m1_f32(vred);
             k += static_cast<uint32_t>(vl);
         }
         y[r] = sum;
@@ -153,64 +196,72 @@ void spmv_csr_rvv(const CSRf32& A, const float* x, float* y) {
 
 
 void spmv_sellc_sigma_scalar(const SELLCSigma& A, const float* x, float* y) {
+    std::vector<float> y_perm(A.n, 0.0f);
+    
     for (uint32_t sid = 0; sid < A.num_slices; ++sid) {
         uint32_t row_start = sid * A.C;
         uint32_t row_end = std::min((sid + 1) * A.C, A.n);
-        uint32_t slice_len = A.slice_lengths[sid];
-        uint32_t slice_idx = A.slice_ptr[sid];
+        uint32_t num_rows_in_slice = row_end - row_start;
         
-        for (uint32_t row = row_start; row < row_end; ++row) {
-            float sum = 0.0f;
-            uint32_t local_row = row - row_start;
+        uint32_t slice_idx = A.slice_ptr[sid];
+        uint32_t slice_len = A.slice_lengths[sid];
+        
+        for (uint32_t j = 0; j < slice_len; ++j) {
+            uint32_t data_idx = slice_idx + j * num_rows_in_slice;
             
-            for (uint32_t k = 0; k < slice_len; ++k) {
-                uint32_t global_idx = slice_idx + local_row * slice_len + k;
-                uint32_t col = A.slice_col_idx[global_idx];
-                float val = A.slice_vals[global_idx];
-                sum += val * x[col];
+            for (uint32_t local_row = 0; local_row < num_rows_in_slice; ++local_row) {
+                uint32_t perm_row = row_start + local_row;
+                uint32_t col = A.slice_col_idx[data_idx + local_row];
+                float val = A.slice_vals[data_idx + local_row];
+                
+                y_perm[perm_row] += val * x[col];
             }
-            
-            y[row] = sum;
         }
+    }
+    
+    for (uint32_t perm_idx = 0; perm_idx < A.n; ++perm_idx) {
+        uint32_t orig_row = A.row_perm[perm_idx];
+        y[orig_row] = y_perm[perm_idx];
     }
 }
 
 void spmv_sellc_sigma_rvv(const SELLCSigma& A, const float* x, float* y) {
+    std::vector<float> y_perm(A.n, 0.0f);
+    
     for (uint32_t sid = 0; sid < A.num_slices; ++sid) {
         uint32_t row_start = sid * A.C;
         uint32_t row_end = std::min((sid + 1) * A.C, A.n);
-        uint32_t slice_len = A.slice_lengths[sid];
-        uint32_t slice_idx = A.slice_ptr[sid];
+        uint32_t num_rows_in_slice = row_end - row_start;
         
-        for (uint32_t row = row_start; row < row_end; ++row) {
-            float sum = 0.0f;
-            uint32_t local_row = row - row_start;
-            uint32_t k = 0;
+        uint32_t slice_idx = A.slice_ptr[sid];
+        uint32_t slice_len = A.slice_lengths[sid];
+        
+        for (uint32_t j = 0; j < slice_len; ++j) {
+            uint32_t data_idx = slice_idx + j * num_rows_in_slice;
+            size_t vl = __riscv_vsetvl_e32m1(num_rows_in_slice);
             
-            while (k < slice_len) {
-                size_t vl = __riscv_vsetvl_e32m1(slice_len - k);
-                
-                uint32_t base_idx = slice_idx + local_row * slice_len + k;
-                
-                vuint32m1_t vcols = __riscv_vle32_v_u32m1(
-                    &A.slice_col_idx[base_idx], vl);
-                
-                vfloat32m1_t vvals = __riscv_vle32_v_f32m1(
-                    &A.slice_vals[base_idx], vl);
-                
-                vuint32m1_t voff = __riscv_vsll_vx_u32m1(vcols, 2, vl);
-                vfloat32m1_t vx = __riscv_vluxei32_v_f32m1(x, voff, vl);
-                vfloat32m1_t vprod = __riscv_vfmul_vv_f32m1(vvals, vx, vl);
-                
-                vfloat32m1_t vzero = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-                vfloat32m1_t vred = __riscv_vfredosum_vs_f32m1_f32m1(vprod, vzero, vl);
-                
-                sum += __riscv_vfmv_f_s_f32m1_f32(vred);
-                k += static_cast<uint32_t>(vl);
-            }
+            vuint32m1_t vcols = __riscv_vle32_v_u32m1(
+                &A.slice_col_idx[data_idx], vl);
             
-            y[row] = sum;
+            vfloat32m1_t vvals = __riscv_vle32_v_f32m1(
+                &A.slice_vals[data_idx], vl);
+            
+            vuint32m1_t voff = __riscv_vsll_vx_u32m1(vcols, 2, vl);
+            vfloat32m1_t vx = __riscv_vluxei32_v_f32m1(x, voff, vl);
+
+            vfloat32m1_t vprod = __riscv_vfmul_vv_f32m1(vvals, vx, vl);
+            
+            vfloat32m1_t vy = __riscv_vle32_v_f32m1(&y_perm[row_start], vl);
+            
+            vfloat32m1_t vy_new = __riscv_vfadd_vv_f32m1(vy, vprod, vl);
+            
+            __riscv_vse32_v_f32m1(&y_perm[row_start], vy_new, vl);
         }
+    }
+    
+    for (uint32_t perm_idx = 0; perm_idx < A.n; ++perm_idx) {
+        uint32_t orig_row = A.row_perm[perm_idx];
+        y[orig_row] = y_perm[perm_idx];
     }
 }
 
@@ -241,7 +292,6 @@ bool verify_results(
 int main() {
     std::vector<CSRf32> matrices;
 
-    // Добавь все матрицы
     matrices.push_back(make_matrix(NASA2910_N, NASA2910_M, NASA2910_NNZ,
         nasa2910_vals, nasa2910_col_idx, nasa2910_row_ptr));
     matrices.push_back(make_matrix(BCSSTK13_N, BCSSTK13_M, BCSSTK13_NNZ,
@@ -263,9 +313,9 @@ int main() {
     matrices.push_back(make_matrix(BCSSTK18_N, BCSSTK18_M, BCSSTK18_NNZ,
         bcsstk18_vals, bcsstk18_col_idx, bcsstk18_row_ptr));
 
-    std::cout << "\n" << std::string(90, '=') << "\n"
-              << "SPARSE MATRIX-VECTOR MULTIPLICATION: CSR vs SELL-C-Sigma\n"
-              << std::string(90, '=') << "\n\n";
+    std::cout << "\n" << std::string(100, '=') << "\n"
+              << "SPARSE MATRIX-VECTOR MULTIPLICATION: CSR vs SELL-C-Sigma (WITH σ-SORTING)\n"
+              << std::string(100, '=') << "\n\n";
 
     double total_csr_scalar = 0.0, total_csr_rvv = 0.0, total_sellc_rvv = 0.0;
 
@@ -279,7 +329,6 @@ int main() {
         std::cout << " | Sparsity=" << std::fixed << std::setprecision(2) 
                   << sparsity << "%\n";
 
-        // Векторы
         std::vector<float> x(A_csr.m);
         std::vector<float> y_csr_scalar(A_csr.n, 0.0f);
         std::vector<float> y_csr_rvv(A_csr.n, 0.0f);
@@ -304,7 +353,12 @@ int main() {
             return 1;
         }
 
-        SELLCSigma A_sellc = csr_to_sellc_sigma(A_csr, 8);
+        uint32_t C = 8;
+        uint32_t sigma = std::min((uint32_t)(C * 8), A_csr.n);
+        SELLCSigma A_sellc = csr_to_sellc_sigma(A_csr, C, sigma);
+
+        std::cout << "  SELL-C-σ: C=" << C << ", σ=" << sigma 
+                  << ", num_slices=" << A_sellc.num_slices << "\n";
 
         auto t5 = std::chrono::high_resolution_clock::now();
         spmv_sellc_sigma_rvv(A_sellc, x.data(), y_sellc_rvv.data());
@@ -329,7 +383,7 @@ int main() {
                   << "  CSR RVV:        " << std::setw(6) << csr_rvv_us << " µs | "
                   << std::setw(5) << csr_rvv_gflops << " GFLOP/s | "
                   << "Speedup: " << std::setw(5) << csr_speedup << "x\n"
-                  << "  SELL-C Sigma:   " << std::setw(6) << sellc_rvv_us << " µs | "
+                  << "  SELL-C-Sigma:   " << std::setw(6) << sellc_rvv_us << " µs | "
                   << std::setw(5) << sellc_rvv_gflops << " GFLOP/s | "
                   << "vs CSR RVV: " << std::setw(5) << sellc_vs_csr << "x\n"
                   << "  Memory overhead (SELL-C): "
@@ -339,12 +393,12 @@ int main() {
         total_csr_rvv += csr_rvv_us;
         total_sellc_rvv += sellc_rvv_us;
 
-        sink[0] = y_csr_rvv[0];
+        sink[0] = y_csr_scalar[0];
     }
 
-    std::cout << std::string(90, '=') << "\n"
+    std::cout << std::string(100, '=') << "\n"
               << "TOTAL STATISTICS\n"
-              << std::string(90, '=') << "\n";
+              << std::string(100, '=') << "\n";
 
     std::cout << std::fixed << std::setprecision(2)
               << "CSR Scalar Total:    " << total_csr_scalar << " µs\n"
@@ -352,7 +406,7 @@ int main() {
               << "Speedup: " << (total_csr_scalar / total_csr_rvv) << "x\n"
               << "SELL-C Sigma Total:  " << total_sellc_rvv << " µs | "
               << "vs CSR RVV: " << (total_csr_rvv / total_sellc_rvv) << "x\n"
-              << std::string(90, '=') << "\n";
+              << std::string(100, '=') << "\n";
 
     return 0;
 }
