@@ -1,0 +1,36 @@
+diff --git a/src/mem/cache/prefetch/base.cc b/src/mem/cache/prefetch/base.cc
+index a85b024..f1952ee 100644
+--- a/src/mem/cache/prefetch/base.cc
++++ b/src/mem/cache/prefetch/base.cc
+@@ -65,7 +65,14 @@ Base::PrefetchInfo::PrefetchInfo(PacketPtr pkt, Addr addr, bool miss)
+     paddress(pkt->req->getPaddr()), cacheMiss(miss)
+ {
+     unsigned int req_size = pkt->req->getSize();
+-    if ((!write && miss) || !pkt->hasData()) {
++    // diploma patch: on a read hit of a CPU request the cache has already
++    // copied the block data into the packet (BaseCache::access ->
++    // satisfyRequest), but the command is still ReadReq, so hasData() is
++    // false and the data was dropped. The Indirect Memory Prefetcher then
++    // panics in PrefetchInfo::get(). Other prefetchers do not read the data.
++    const bool cpu_read_hit = pkt->isRead() && !miss && !pkt->fromCache() &&
++                              pkt->hasRespData();
++    if ((!write && miss) || !(pkt->hasData() || cpu_read_hit)) {
+         data = nullptr;
+     } else {
+         data = new uint8_t[req_size];
+diff --git a/src/mem/cache/prefetch/bop.cc b/src/mem/cache/prefetch/bop.cc
+index 3954ae1..368c609 100644
+--- a/src/mem/cache/prefetch/bop.cc
++++ b/src/mem/cache/prefetch/bop.cc
+@@ -234,7 +234,10 @@ BOP::bestOffsetLearning(Addr addr_tag)
+      * by right shifting it, and then subtract the offset. This gives us a
+      * new lookup address which we use to compute the lookup tag
+      */
+-    Addr lookup_tag = tag((addr_tag << lBlkSize) - (offset_tag << lBlkSize));
++    // diploma patch: the caller passes a full address, not a tag (the same
++    // fix as in gem5 develop); the old line compared byte addresses with
++    // line tags, so BOP never learned an offset and never prefetched.
++    Addr lookup_tag = tag(addr_tag - (offset_tag << lBlkSize));
+ 
+     // There was a hit in the RR table, increment the score for this offset
+     if (testRR(lookup_tag)) {

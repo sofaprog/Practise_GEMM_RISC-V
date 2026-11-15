@@ -63,3 +63,9 @@ vfloat64m2_t __riscv_vfcross_vv_f64m2(vfloat64m2_t, vfloat64m2_t, size_t)
 vfloat64m4_t __riscv_vfcross_vv_f64m4(vfloat64m4_t, vfloat64m4_t, size_t)
 vfloat64m8_t __riscv_vfcross_vv_f64m8(vfloat64m8_t, vfloat64m8_t, size_t)
 ```
+## Дипломная работа: SpMV (CSR, SELL-C-σ) на RVV в gem5
+
+Эксперименты с префетчерами и латентностями векторных операций лежат в папке
+[`diploma/`](diploma/README.md): код бенчмарка, конфигурация gem5, скрипты
+запусков и результаты (CSV, машинный код ядер).
+Папка `my_tests/` содержит более ранние версии кода (январь–сентябрь 2026).
