@@ -18,3 +18,9 @@ cross
 
 *.log
 
+
+Windows
+*:Zone.Identifier
+my_tests/venv/
+generated/
+matrices/*.mtx
